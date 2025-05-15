@@ -54,6 +54,7 @@ def listen_web_carmer():
     cv2.destroyWindow("原始视频流")
     print("网络摄像头线程结束")
 
+
 def local_video():
     cap = cv2.VideoCapture(local_video_path)
     if not cap.isOpened():
@@ -101,66 +102,111 @@ def read_labels_to_dict(filepath):
         print(f"读取标签CSV文件{filepath}时出错: {e}")
         return {}
 
-def 
 
+def get_center_crop(frame, scale=2/3):
+    height, width = frame.shape[:2]
+    
+    center_width = int(width * scale)
+    center_height = int(height * scale)
+    
+    start_x = (width - center_width) // 2
+    start_y = (height - center_height) // 2
+    
+    center_crop = frame[start_y:start_y+center_height, start_x:start_x+center_width]
+    return center_crop
 
-def predict():
-    window_created = False
+def split_into_four_blocks(frame):
+    height, width = frame.shape[:2]
+    
+    half_width = width // 2
+    half_height = height // 2
+    
+    top_left = frame[0:half_height, 0:half_width]
+    top_right = frame[0:half_height, half_width:width]
+    bottom_left = frame[half_height:height, 0:half_width]
+    bottom_right = frame[half_height:height, half_width:width]
+    
+    return [top_left, top_right, bottom_left, bottom_right]
+
+def rcut_img():
+    while True:
+        try:
+            frame = frame_queue.get(timeout=1)
+        except queue.Empty:
+            with condLock_empty:
+                try:
+                    condLock_empty.wait(timeout=0.5)
+                except RuntimeError:
+                    print("等待队列超时，继续检查...")
+            continue
+        four_block = split_into_four_blocks(frame=frame)
+        center_block = get_center_crop(frame=frame)
+        frame_tensor = preprocess_frame(frame=frame)
+        center_block_tensor = preprocess_frame(frame=center_block)
+        four_block_tensor_list = [preprocess_frame(frame=block) for block in four_block]
+        origin_pred = predict_tensor(frame_tensor)
+        center_pred = predict_tensor(center_block_tensor)
+        block_preds = [predict_tensor(block_tensor) for block_tensor in four_block_tensor_list]
+        all_preds = [origin_pred, center_pred] + block_preds
+        # 选择置信度最大的预测作为最终结果
+        best_pred = max(all_preds, key=lambda x: x['confidence'])
+        print(f" {best_pred['class_name']} (ID: {best_pred['class_id']}, 置信度: {best_pred['confidence']:.4f})")
+        result_frame = frame.copy()
+
+        cv2.putText(
+            result_frame,
+            f"{best_pred['class_name']} ({best_pred['confidence']:.4f}))",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+        cv2.namedWindow("result", cv2.WINDOW_NORMAL)
+        cv2.imshow("result", result_frame)
+        window_created = True
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        else:
+            print(f"unknown")
+
+def predict_tensor(processed_tensor):
+    """
+    使用预处理后的张量进行预测
+    
+    参数:
+        processed_tensor: 已经预处理过的图像张量，通过preprocess_frame函数生成
+        original_frame: 原始图像帧，如果需要可视化结果则提供
+        
+    返回:
+        dict: 包含预测结果的字典，格式如下:
+            {
+                'class_name': 预测的类别名称,
+                'class_id': 原始预测的类别ID
+            }
+    """
     model.eval()
     with paddle.no_grad():
-        while True:
+        logits = model(processed_tensor)
+        probabilities = paddle.nn.functional.softmax(logits, axis=1)
+        pred_idx = paddle.argmax(logits, axis=1).numpy()[0]
+        confidence = probabilities[0][pred_idx].numpy().item()
+        result = {
+            'class_id': int(pred_idx),
+            'confidence': float(confidence),
+        }
+        if pred_idx in label_dict:
+            idx_temp = label_dict[pred_idx]
             try:
-                frame = frame_queue.get(timeout=1)
-                processed_frame = preprocess_frame(frame)
-                logits = model(processed_frame)
-                probabilities = paddle.nn.functional.softmax(logits, axis=1)
-                pred_idx = paddle.argmax(logits, axis=1).numpy()[0]
-                confidence = probabilities[0][pred_idx].numpy().item()
-                if pred_idx in label_dict:
-                    idx_temp = 0
-                    idx_temp = label_dict[pred_idx]
-                    try:
-                        pred_class_name = result_name[int(idx_temp)]
-                    except:
-                        print(idx_temp)
-                    print(f"检测到: {pred_class_name} (ID: {pred_idx}, 置信度: {confidence:.4f})")
-                    result_frame = frame.copy()
-                    cv2.putText(
-                        result_frame,
-                        f"{pred_class_name} ({confidence:.2f})",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 255, 0),
-                        2
-                    )
-                    cv2.namedWindow("result", cv2.WINDOW_NORMAL)
-                    cv2.imshow("result", result_frame)
-                    window_created = True
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                else:
-                    print(f"unknown: {pred_idx}")
-                    
-            except queue.Empty:
-                with condLock_empty:
-                    try:
-                        condLock_empty.wait(timeout=0.5)
-                    except RuntimeError:
-                        print("等待队列超时，继续检查...")
-                continue
-            except Exception as e:
-                print(f"预测线程出错: {e}")
-                import traceback
-                traceback.print_exc()
-                break
-    
-    if window_created:
-        try:
-            cv2.destroyWindow("预测结果")
-        except:
-            pass
-    print("预测线程结束")
+                pred_class_name = result_name[int(idx_temp)]
+                result['class_name'] = pred_class_name
+            except:
+                result['class_name'] = f"未知类别({idx_temp})"
+                print(f"警告: 无法找到类别 ID {idx_temp} 的名称")
+        else:
+            result['class_name'] = f"未知类别({pred_idx})"
+            print(f"警告: 未知的类别 ID: {pred_idx}")
+        return result
 
 if __name__ == "__main__":  
     rtsp_url = config.rtsp_url
@@ -219,7 +265,7 @@ if __name__ == "__main__":
         capture_thread = threading.Thread(target=local_video, daemon=True)
         capture_thread.start()
     
-    predict_thread = threading.Thread(target=predict, daemon=True)
+    predict_thread = threading.Thread(target=rcut_img, daemon=True)
     predict_thread.start()
     
     try:
