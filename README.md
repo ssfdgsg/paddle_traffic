@@ -4,5 +4,6 @@
 
 数据集地址：https://aistudio.baidu.com/projectdetail/9106955可以启动环境后从此处下载
 
-推荐文件结构![Uploading image.png…]()
+推荐文件结构：如dir图片
+
 
